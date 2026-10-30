@@ -1,0 +1,32 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer subtle glow ring -->
+    <path
+        android:fillColor="#22F43F5E"
+        android:pathData="M54,54m-31,0a31,31 0,1 1,62 0a31,31 0,1 1,-62 0" />
+    <!-- Neon PulseWave Equalizer + Play Symbol -->
+    <path android:pathData="M34,47 C34,45.3 35.3,44 37,44 C38.7,44 40,45.3 40,47 L40,61 C40,62.7 38.7,64 37,64 C35.3,64 34,62.7 34,61 Z M44,38 C44,36.3 45.3,35 47,35 C48.7,35 50,36.3 50,38 L50,70 C50,71.7 48.7,73 47,73 C45.3,73 44,71.7 44,70 Z M54,32 C54,30.3 55.3,29 57,29 C58.7,29 60,30.3 60,32 L60,76 C60,77.7 58.7,79 57,79 C55.3,79 54,77.7 54,76 Z M64,41 C64,39.3 65.3,38 67,38 C68.7,38 70,39.3 70,41 L70,67 C70,68.7 68.7,70 67,70 C65.3,70 64,68.7 64,67 Z M74,48 C74,46.3 75.3,45 77,45 C78.7,45 80,46.3 80,48 L80,60 C80,61.7 78.7,63 77,63 C75.3,63 74,61.7 74,60 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:endX="80"
+                android:endY="78"
+                android:startX="34"
+                android:startY="30"
+                android:type="linear">
+                <item
+                    android:color="#FFFF5C8A"
+                    android:offset="0.0" />
+                <item
+                    android:color="#FFF43F5E"
+                    android:offset="0.5" />
+                <item
+                    android:color="#FF8B5CF6"
+                    android:offset="1.0" />
+            </gradient>
+        </aapt:attr>
+    </path>
+</vector>

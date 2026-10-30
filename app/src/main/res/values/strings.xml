@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">PulseWave Music</string>
+    <string name="notification_channel_playback">Music Playback</string>
+    <string name="notification_channel_downloads">Offline Song Downloads</string>
+</resources>
