@@ -35,7 +35,7 @@ object CatalogPresets {
         MoodCategory(
             id = "hiphop",
             title = "Desi Hip-Hop",
-            subtitle = "Seedhe Maut, KR$NA, Divine, Raftaar",
+            subtitle = "Seedhe Maut, KR\$NA, Divine, Raftaar",
             assetCover = "file:///android_asset/covers/desi_hiphop.png",
             searchQuery = "Desi Hip Hop Rap Hits Divine KRSNA Seedhe Maut",
             accentColor = 0xFF10B981
