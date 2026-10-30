@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: "17"
@@ -53,7 +53,16 @@ jobs:
           KEYSTORE_PASSWORD: pulsewave123
           KEY_ALIAS: pulsewave
           KEY_PASSWORD: pulsewave123
-        run: ./gradlew assembleRelease --no-daemon --stacktrace
+        run: |
+          set +e
+          ./gradlew assembleRelease --no-daemon > build.log 2>&1
+          STATUS=$?
+          cat build.log
+          if [ $STATUS -ne 0 ]; then
+            SUMMARY_ERR=$(grep -E "^e: |FAILURE:|What went wrong|^> |Unresolved|Execution failed" -A 2 build.log | tail -n 35 | tr '\n' ' ' | cut -c1-3500)
+            echo "::error title=GradleFailure::$SUMMARY_ERR"
+            exit $STATUS
+          fi
 
       - name: Inspect Built APKs & Sizes
         run: |

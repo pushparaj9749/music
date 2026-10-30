@@ -12,6 +12,10 @@ val keystorePassword = System.getenv("KEYSTORE_PASSWORD") ?: "pulsewave123"
 val keyAliasName = System.getenv("KEY_ALIAS") ?: "pulsewave"
 val keyPasswordValue = System.getenv("KEY_PASSWORD") ?: "pulsewave123"
 
+base {
+    archivesName.set("PulseWave-v1.0.0")
+}
+
 android {
     namespace = "com.pulsewave.music"
     compileSdk = 35
@@ -119,16 +123,6 @@ android {
     lint {
         abortOnError = false
         checkReleaseBuilds = false
-    }
-
-    applicationVariants.all {
-        val variant = this
-        variant.outputs
-            .map { it as com.android.build.gradle.internal.api.BaseVariantOutputImpl }
-            .forEach { output ->
-                val abiFilter = output.getFilter(com.android.build.OutputFile.ABI) ?: "universal"
-                output.outputFileName = "PulseWave-v${variant.versionName}-${abiFilter}-${variant.buildType.name}.apk"
-            }
     }
 }
 
