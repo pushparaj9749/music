@@ -11,12 +11,8 @@ import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.PlaybackParameters
 import androidx.media3.common.Player
-import androidx.media3.database.StandaloneDatabaseProvider
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.RawResourceDataSource
-import androidx.media3.datasource.cache.CacheDataSource
-import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
-import androidx.media3.datasource.cache.SimpleCache
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.dash.DashMediaSource
 import androidx.media3.exoplayer.dash.manifest.DashManifestParser
@@ -27,6 +23,7 @@ import com.pulsewave.music.PulseWaveApp
 import com.pulsewave.music.R
 import com.pulsewave.music.model.AppSettings
 import com.pulsewave.music.model.SongTrack
+import com.pulsewave.music.model.StreamCandidate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -75,38 +72,10 @@ class PlayerEngineBridge(context: Context) {
 
     private var playJob: Job? = null
     private var sleepTimerJob: Job? = null
-    private var retryAttemptForCurrentTrack = 0
 
-    private val diskCache: SimpleCache by lazy {
-        val dir = File(appContext.cacheDir, "pulsewave_media_cache").apply { mkdirs() }
-        SimpleCache(
-            dir,
-            LeastRecentlyUsedCacheEvictor(256L * 1024L * 1024L),
-            StandaloneDatabaseProvider(appContext)
-        )
-    }
-
-    private val ytDashDataSourceFactory by lazy {
-        CacheDataSource.Factory()
-            .setCache(diskCache)
-            .setUpstreamDataSourceFactory(
-                YoutubeMedia3DataSource.Factory(rangeParameterEnabled = true, rnParameterEnabled = true)
-            )
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-    }
-
-    private val ytProgressiveDataSourceFactory by lazy {
-        CacheDataSource.Factory()
-            .setCache(diskCache)
-            .setUpstreamDataSourceFactory(
-                YoutubeMedia3DataSource.Factory(rangeParameterEnabled = false, rnParameterEnabled = true)
-            )
-            .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
-    }
-
-    private val ytHlsDataSourceFactory by lazy {
-        YoutubeMedia3DataSource.Factory(rangeParameterEnabled = false, rnParameterEnabled = false)
-    }
+    private var activeCandidates: List<StreamCandidate> = emptyList()
+    private var activeCandidateIndex: Int = 0
+    private var freshResolveAttemptedForCurrentTrack = false
 
     private val localDataSourceFactory by lazy {
         DefaultDataSource.Factory(appContext)
@@ -190,17 +159,59 @@ class PlayerEngineBridge(context: Context) {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                val cur = _playbackState.value.currentTrack
-                if (cur != null && retryAttemptForCurrentTrack == 0 && !cur.isOfflineReady) {
-                    retryAttemptForCurrentTrack = 1
+                val cur = _playbackState.value.currentTrack ?: return
+                if (cur.isOfflineReady) {
+                    _playbackState.update {
+                        it.copy(
+                            isBuffering = false,
+                            isPlaying = false,
+                            errorMessage = "Playback error: ${error.localizedMessage ?: "Audio error"}"
+                        )
+                    }
+                    return
+                }
+
+                // 1. Try next backup stream candidate immediately!
+                val nextCandidateIdx = activeCandidateIndex + 1
+                if (nextCandidateIdx < activeCandidates.size) {
+                    activeCandidateIndex = nextCandidateIdx
+                    val nextCandidate = activeCandidates[nextCandidateIdx]
+                    playJob?.cancel()
+                    playJob = mainScope.launch {
+                        prepareAndPlayCandidate(cur, nextCandidate)
+                    }
+                    return
+                }
+
+                // 2. If all cached candidates failed, invalidate cache and re-extract once
+                if (!freshResolveAttemptedForCurrentTrack) {
+                    freshResolveAttemptedForCurrentTrack = true
                     PulseWaveApp.instance.youtubeRepo.invalidateStreamCache(cur.id)
                     loadAndPlayTrackInternal(cur)
+                    return
+                }
+
+                // 3. If queue has more songs, auto-advance so playback never gets stuck on 1 bad video
+                val st = _playbackState.value
+                if (st.queue.size > 1 && st.currentQueueIndex + 1 < st.queue.size) {
+                    _playbackState.update {
+                        it.copy(
+                            streamInfoBadge = "Skipping unavailable track...",
+                            errorMessage = null
+                        )
+                    }
+                    mainScope.launch {
+                        delay(600L)
+                        if (_playbackState.value.currentTrack?.id == cur.id) {
+                            skipNext()
+                        }
+                    }
                 } else {
                     _playbackState.update {
                         it.copy(
                             isBuffering = false,
                             isPlaying = false,
-                            errorMessage = "Playback error: ${error.localizedMessage ?: "Stream unavailable"}"
+                            errorMessage = "Stream unavailable (${error.errorCodeName}). Tap another song or retry."
                         )
                     }
                 }
@@ -237,13 +248,17 @@ class PlayerEngineBridge(context: Context) {
         mainScope.launch {
             ensureServiceStarted()
             val newQueue = if (contextQueue.isNotEmpty()) {
-                if (contextQueue.any { it.id == track.id }) contextQueue else listOf(track) + contextQueue
+                val deduped = contextQueue.distinctBy { it.id }
+                if (deduped.any { it.id == track.id }) deduped else listOf(track) + deduped
             } else {
                 val existing = _playbackState.value.queue
                 if (existing.any { it.id == track.id }) existing else listOf(track) + existing
             }
             val index = newQueue.indexOfFirst { it.id == track.id }.coerceAtLeast(0)
-            retryAttemptForCurrentTrack = 0
+            activeCandidates = emptyList()
+            activeCandidateIndex = 0
+            freshResolveAttemptedForCurrentTrack = false
+
             _playbackState.update {
                 it.copy(
                     currentTrack = track,
@@ -266,6 +281,7 @@ class PlayerEngineBridge(context: Context) {
         playJob = mainScope.launch {
             exoPlayer.stop()
             exoPlayer.clearMediaItems()
+            exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
 
             val metadata = buildMediaMetadata(track)
 
@@ -283,21 +299,23 @@ class PlayerEngineBridge(context: Context) {
                     .setMediaMetadata(metadata)
                     .build()
                 val source = ProgressiveMediaSource.Factory(localDataSourceFactory).createMediaSource(item)
-                exoPlayer.repeatMode = Player.REPEAT_MODE_ONE // Studio loops groove seamlessly
+                // Only loop single track if queue has just 1 item; otherwise advance through queue!
+                exoPlayer.repeatMode = if (_playbackState.value.queue.size <= 1) {
+                    Player.REPEAT_MODE_ONE
+                } else {
+                    Player.REPEAT_MODE_OFF
+                }
                 exoPlayer.setMediaSource(source)
                 exoPlayer.prepare()
                 exoPlayer.playWhenReady = true
                 _playbackState.update {
                     it.copy(
                         isBuffering = false,
-                        streamInfoBadge = "Offline PCM Studio Loop"
+                        streamInfoBadge = "Offline PCM Studio"
                     )
                 }
                 return@launch
             }
-
-            // Reset ExoPlayer single-loop if we came from studio loop
-            exoPlayer.repeatMode = Player.REPEAT_MODE_OFF
 
             // 2. Check downloaded offline file
             val downloadedMatch = PulseWaveApp.instance.localStore.state.value.downloadedSongs
@@ -322,55 +340,43 @@ class PlayerEngineBridge(context: Context) {
                 return@launch
             }
 
-            // 3. Resolve YouTube audio stream
+            // 3. Resolve YouTube audio stream across multi-engine candidates
             val settings = PulseWaveApp.instance.localStore.state.value.settings
             val result = PulseWaveApp.instance.youtubeRepo.resolvePlaybackStream(
                 track = track,
                 preferHighQuality = settings.highQualityAudio
             )
 
+            // Guard against stale coroutine if user tapped a newer song while resolving
+            if (_playbackState.value.currentTrack?.id != track.id) return@launch
+
             result.fold(
                 onSuccess = { resolved ->
-                    val uri = Uri.parse(resolved.streamUrl)
-                    val item = MediaItem.Builder()
-                        .setMediaId(track.id)
-                        .setUri(uri)
-                        .setCustomCacheKey(track.id)
-                        .setMediaMetadata(metadata)
-                        .build()
-
-                    val mediaSource: MediaSource = when {
-                        resolved.isHls -> {
-                            HlsMediaSource.Factory(ytHlsDataSourceFactory).createMediaSource(item)
-                        }
-                        !resolved.dashManifestXml.isNullOrBlank() -> {
-                            runCatching {
-                                val manifest = withContext(Dispatchers.IO) {
-                                    DashManifestParser().parse(
-                                        uri,
-                                        ByteArrayInputStream(resolved.dashManifestXml.toByteArray(Charsets.UTF_8))
-                                    )
-                                }
-                                DashMediaSource.Factory(ytDashDataSourceFactory)
-                                    .createMediaSource(manifest, item)
-                            }.getOrElse {
-                                ProgressiveMediaSource.Factory(ytProgressiveDataSourceFactory)
-                                    .createMediaSource(item)
-                            }
-                        }
-                        else -> {
-                            ProgressiveMediaSource.Factory(ytProgressiveDataSourceFactory)
-                                .createMediaSource(item)
-                        }
+                    val candidates = resolved.candidates.ifEmpty {
+                        listOf(
+                            StreamCandidate(
+                                streamUrl = resolved.streamUrl,
+                                isHls = resolved.isHls,
+                                dashManifestXml = resolved.dashManifestXml,
+                                mimeType = resolved.mimeType,
+                                bitrate = resolved.bitrate,
+                                contentLength = resolved.contentLength,
+                                engineLabel = resolved.resolvedViaEngine,
+                                headers = resolved.headers,
+                                preferPostVideoPlayback = resolved.preferPostVideoPlayback
+                            )
+                        )
                     }
+                    activeCandidates = candidates
+                    activeCandidateIndex = 0
 
-                    // Append related tracks for Endless Auto-Radio if enabled and queue is running low
+                    // Append related tracks for Endless Auto-Radio when queue is running low
                     if (settings.autoRadioEnabled && resolved.relatedTracks.isNotEmpty()) {
                         _playbackState.update { st ->
                             val existingIds = st.queue.map { q -> q.id }.toSet()
                             val fresh = resolved.relatedTracks.filterNot { r -> r.id in existingIds }
                             if (st.queue.size - st.currentQueueIndex <= 4 && fresh.isNotEmpty()) {
-                                st.copy(queue = st.queue + fresh.take(10))
+                                st.copy(queue = st.queue + fresh.take(12))
                             } else st
                         }
                     }
@@ -378,27 +384,115 @@ class PlayerEngineBridge(context: Context) {
                     _playbackState.update {
                         it.copy(
                             durationMs = if (resolved.durationSec > 0) resolved.durationSec * 1000L else it.durationMs,
-                            streamInfoBadge = resolved.resolvedViaEngine,
                             errorMessage = null
                         )
                     }
 
-                    exoPlayer.setMediaSource(mediaSource)
-                    exoPlayer.prepare()
-                    exoPlayer.playWhenReady = true
+                    prepareAndPlayCandidate(track, candidates.first())
                 },
                 onFailure = { err ->
-                    _playbackState.update {
-                        it.copy(
-                            isBuffering = false,
-                            isPlaying = false,
-                            streamInfoBadge = "Stream Failed",
-                            errorMessage = err.message ?: "Unable to extract YouTube audio"
-                        )
+                    val st = _playbackState.value
+                    if (st.queue.size > 1 && st.currentQueueIndex + 1 < st.queue.size) {
+                        _playbackState.update {
+                            it.copy(
+                                streamInfoBadge = "Trying next song...",
+                                errorMessage = null
+                            )
+                        }
+                        delay(500L)
+                        if (_playbackState.value.currentTrack?.id == track.id) {
+                            skipNext()
+                        }
+                    } else {
+                        _playbackState.update {
+                            it.copy(
+                                isBuffering = false,
+                                isPlaying = false,
+                                streamInfoBadge = "Stream Failed",
+                                errorMessage = err.message ?: "Unable to extract YouTube audio"
+                            )
+                        }
                     }
                 }
             )
         }
+    }
+
+    private suspend fun prepareAndPlayCandidate(track: SongTrack, candidate: StreamCandidate) {
+        if (_playbackState.value.currentTrack?.id != track.id) return
+        val metadata = buildMediaMetadata(track)
+        val uri = Uri.parse(candidate.streamUrl)
+        val item = MediaItem.Builder()
+            .setMediaId("${track.id}_${activeCandidateIndex}")
+            .setUri(uri)
+            .setMediaMetadata(metadata)
+            .build()
+
+        val mediaSource: MediaSource = when {
+            candidate.isHls -> {
+                val hlsFactory = YoutubeMedia3DataSource.Factory(
+                    rangeParameterEnabled = false,
+                    rnParameterEnabled = false,
+                    chunkedUnboundedEnabled = false,
+                    preferPostVideoPlayback = false,
+                    defaultHeaders = candidate.headers
+                )
+                HlsMediaSource.Factory(hlsFactory).createMediaSource(item)
+            }
+            !candidate.dashManifestXml.isNullOrBlank() -> {
+                runCatching {
+                    val manifest = withContext(Dispatchers.IO) {
+                        DashManifestParser().parse(
+                            uri,
+                            ByteArrayInputStream(candidate.dashManifestXml.toByteArray(Charsets.UTF_8))
+                        )
+                    }
+                    val dashFactory = YoutubeMedia3DataSource.Factory(
+                        rangeParameterEnabled = true,
+                        rnParameterEnabled = true,
+                        chunkedUnboundedEnabled = false,
+                        preferPostVideoPlayback = candidate.preferPostVideoPlayback,
+                        defaultHeaders = candidate.headers
+                    )
+                    DashMediaSource.Factory(dashFactory).createMediaSource(manifest, item)
+                }.getOrElse {
+                    val progFactory = YoutubeMedia3DataSource.Factory(
+                        rangeParameterEnabled = false,
+                        rnParameterEnabled = true,
+                        chunkedUnboundedEnabled = true,
+                        preferPostVideoPlayback = candidate.preferPostVideoPlayback,
+                        defaultHeaders = candidate.headers
+                    )
+                    ProgressiveMediaSource.Factory(progFactory).createMediaSource(item)
+                }
+            }
+            else -> {
+                val progFactory = YoutubeMedia3DataSource.Factory(
+                    rangeParameterEnabled = false,
+                    rnParameterEnabled = true,
+                    chunkedUnboundedEnabled = true,
+                    preferPostVideoPlayback = candidate.preferPostVideoPlayback,
+                    defaultHeaders = candidate.headers
+                )
+                ProgressiveMediaSource.Factory(progFactory).createMediaSource(item)
+            }
+        }
+
+        if (_playbackState.value.currentTrack?.id != track.id) return
+
+        _playbackState.update {
+            it.copy(
+                streamInfoBadge = candidate.engineLabel,
+                errorMessage = null,
+                isBuffering = true
+            )
+        }
+
+        exoPlayer.stop()
+        exoPlayer.clearMediaItems()
+        exoPlayer.setMediaSource(mediaSource)
+        exoPlayer.prepare()
+        exoPlayer.playWhenReady = true
     }
 
     fun togglePlayPause() {
@@ -439,14 +533,19 @@ class PlayerEngineBridge(context: Context) {
                 else -> return@launch
             }
             val nextTrack = q[nextIndex]
-            retryAttemptForCurrentTrack = 0
+            activeCandidates = emptyList()
+            activeCandidateIndex = 0
+            freshResolveAttemptedForCurrentTrack = false
+
             _playbackState.update {
                 it.copy(
                     currentTrack = nextTrack,
                     currentQueueIndex = nextIndex,
                     positionMs = 0L,
                     durationMs = nextTrack.durationSec * 1000L,
-                    isBuffering = true
+                    isBuffering = true,
+                    errorMessage = null,
+                    streamInfoBadge = if (nextTrack.isOfflineReady) "Offline Studio" else "Connecting YT..."
                 )
             }
             PulseWaveApp.instance.localStore.recordRecentlyPlayed(nextTrack)
@@ -471,14 +570,19 @@ class PlayerEngineBridge(context: Context) {
                 0
             }
             val prevTrack = q[prevIndex]
-            retryAttemptForCurrentTrack = 0
+            activeCandidates = emptyList()
+            activeCandidateIndex = 0
+            freshResolveAttemptedForCurrentTrack = false
+
             _playbackState.update {
                 it.copy(
                     currentTrack = prevTrack,
                     currentQueueIndex = prevIndex,
                     positionMs = 0L,
                     durationMs = prevTrack.durationSec * 1000L,
-                    isBuffering = true
+                    isBuffering = true,
+                    errorMessage = null,
+                    streamInfoBadge = if (prevTrack.isOfflineReady) "Offline Studio" else "Connecting YT..."
                 )
             }
             PulseWaveApp.instance.localStore.recordRecentlyPlayed(prevTrack)
@@ -571,8 +675,12 @@ class PlayerEngineBridge(context: Context) {
     fun clearDiskCache(): String {
         return runCatching {
             val cacheDir = File(appContext.cacheDir, "pulsewave_media_cache")
-            val sizeMb = cacheDir.walkTopDown().filter { it.isFile }.sumOf { it.length() } / (1024 * 1024)
-            "Freed ~${sizeMb} MB audio stream cache"
+            val sizeMb = if (cacheDir.exists()) {
+                val mb = cacheDir.walkTopDown().filter { it.isFile }.sumOf { it.length() } / (1024 * 1024)
+                cacheDir.deleteRecursively()
+                mb
+            } else 0L
+            "Freed ~${sizeMb} MB stream cache"
         }.getOrDefault("Cache cleaned")
     }
 

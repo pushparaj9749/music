@@ -13,7 +13,7 @@ val keyAliasName = System.getenv("KEY_ALIAS") ?: "pulsewave"
 val keyPasswordValue = System.getenv("KEY_PASSWORD") ?: "pulsewave123"
 
 base {
-    archivesName.set("PulseWave-v1.0.0")
+    archivesName.set("PulseWave-v1.1.0")
 }
 
 android {
@@ -24,8 +24,8 @@ android {
         applicationId = "com.pulsewave.music"
         minSdk = 26
         targetSdk = 35
-        versionCode = 100
-        versionName = "1.0.0"
+        versionCode = 110
+        versionName = "1.1.0"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -124,6 +124,16 @@ android {
         abortOnError = false
         checkReleaseBuilds = false
     }
+
+    testOptions {
+        unitTests.isReturnDefaultValues = true
+    }
+}
+
+tasks.withType<Test>().configureEach {
+    testLogging {
+        showStandardStreams = true
+    }
 }
 
 dependencies {
@@ -174,4 +184,6 @@ dependencies {
     implementation(libs.newpipe.extractor)
     implementation(libs.youtubedl.library)
     implementation(libs.youtubedl.ffmpeg)
+
+    testImplementation("junit:junit:4.13.2")
 }

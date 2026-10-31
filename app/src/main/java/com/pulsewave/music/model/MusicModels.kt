@@ -134,13 +134,29 @@ data class DownloadTaskState(
     val isFailed: Boolean = false
 )
 
+data class StreamCandidate(
+    val streamUrl: String,
+    val isHls: Boolean = false,
+    val dashManifestXml: String? = null,
+    val mimeType: String? = null,
+    val bitrate: Int = 0,
+    val contentLength: Long = -1L,
+    val engineLabel: String = "NewPipe VisionOS",
+    val headers: Map<String, String> = emptyMap(),
+    val preferPostVideoPlayback: Boolean = true
+)
+
 data class ResolvedPlaybackStream(
     val streamUrl: String,
     val isHls: Boolean = false,
     val dashManifestXml: String? = null,
     val mimeType: String? = null,
     val bitrate: Int = 0,
+    val contentLength: Long = -1L,
     val durationSec: Long = 0L,
     val relatedTracks: List<SongTrack> = emptyList(),
-    val resolvedViaEngine: String = "NewPipe VisionOS"
+    val resolvedViaEngine: String = "NewPipe VisionOS",
+    val headers: Map<String, String> = emptyMap(),
+    val preferPostVideoPlayback: Boolean = true,
+    val candidates: List<StreamCandidate> = emptyList()
 )

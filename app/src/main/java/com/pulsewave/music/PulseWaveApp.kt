@@ -45,10 +45,16 @@ class PulseWaveApp : Application() {
             it.applySettings(localStore.state.value.settings)
         }
 
-        // Initialize embedded Python + yt-dlp + FFmpeg native runtime asynchronously
+        // Initialize embedded Python + yt-dlp + FFmpeg native runtime and auto-update nightly extractor
         appScope.launch {
             runCatching { YoutubeDL.getInstance().init(this@PulseWaveApp) }
             runCatching { FFmpeg.getInstance().init(this@PulseWaveApp) }
+            runCatching {
+                YoutubeDL.getInstance().updateYoutubeDL(
+                    this@PulseWaveApp,
+                    YoutubeDL.UpdateChannel.NIGHTLY
+                )
+            }
         }
     }
 

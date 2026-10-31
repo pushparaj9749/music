@@ -225,13 +225,29 @@ fun HomeScreen(
                         Spacer(modifier = Modifier.height(12.dp))
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Button(
-                                onClick = { onPlayStudioOfflineBeat(0) },
+                                onClick = {
+                                    val livePool = (homeState.trendingHits + homeState.quickPicks + homeState.chillVibes)
+                                        .distinctBy { it.id }
+                                    if (livePool.isNotEmpty()) {
+                                        onPlayTrack(livePool.first(), livePool)
+                                    } else {
+                                        onPlayStudioOfflineBeat(0)
+                                    }
+                                },
                                 colors = ButtonDefaults.buttonColors(containerColor = primary),
                                 shape = RoundedCornerShape(12.dp)
                             ) {
                                 Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
                                 Spacer(modifier = Modifier.width(4.dp))
-                                Text("Lo-Fi Beat", fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                                Text(
+                                    text = if (homeState.trendingHits.isNotEmpty() || homeState.quickPicks.isNotEmpty()) {
+                                        "Play Top Hits"
+                                    } else {
+                                        "Lo-Fi Beat"
+                                    },
+                                    fontWeight = FontWeight.Bold,
+                                    fontSize = 13.sp
+                                )
                             }
                             FilledTonalButton(
                                 onClick = onOpenAmbientStudio,

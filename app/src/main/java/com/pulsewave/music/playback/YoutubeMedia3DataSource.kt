@@ -5,78 +5,139 @@ import androidx.media3.common.C
 import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
-import com.pulsewave.music.youtube.NewPipeOkHttpDownloader
-import org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper
+import com.pulsewave.music.youtube.OpenedYoutubeStream
+import com.pulsewave.music.youtube.YoutubeHttpEngine
 import java.io.IOException
-import java.io.InputStream
-import java.net.HttpURLConnection
 import java.net.URL
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 
 /**
- * Media3 network DataSource tailored for YouTube audio streaming.
- * Uses VisionOS / Firefox User-Agents, request numbering (&rn=), byte-range query params (&range=),
- * and POST {0x78, 0} on /videoplayback URLs to prevent YouTube CDN throttling and HTTP 403s.
+ * Bulletproof Media3 network DataSource for YouTube audio streaming.
+ * - Handles HTTP 301/302/303/307/308 ISP edge redirects on POST /videoplayback requests
+ * - Automatically falls back between POST {0x78, 0} (&range=) and GET (Range: bytes=)
+ * - Transparently chunks unbounded /videoplayback streams into 512 KB range requests
+ *   so YouTube CDNs never throttle bandwidth or cut off Android VR / VisionOS streams at 1 MiB.
  */
 class YoutubeMedia3DataSource(
     private val rangeParameterEnabled: Boolean,
-    private val rnParameterEnabled: Boolean
+    private val rnParameterEnabled: Boolean,
+    private val chunkedUnboundedEnabled: Boolean,
+    private val preferPostVideoPlayback: Boolean,
+    private val defaultHeaders: Map<String, String>
 ) : BaseDataSource(/* isNetwork = */ true) {
 
     class Factory(
         private val rangeParameterEnabled: Boolean = true,
-        private val rnParameterEnabled: Boolean = true
+        private val rnParameterEnabled: Boolean = true,
+        private val chunkedUnboundedEnabled: Boolean = false,
+        private val preferPostVideoPlayback: Boolean = true,
+        private val defaultHeaders: Map<String, String> = emptyMap()
     ) : DataSource.Factory {
-        override fun createDataSource(): DataSource =
-            YoutubeMedia3DataSource(rangeParameterEnabled, rnParameterEnabled)
+        override fun createDataSource(): DataSource = YoutubeMedia3DataSource(
+            rangeParameterEnabled = rangeParameterEnabled,
+            rnParameterEnabled = rnParameterEnabled,
+            chunkedUnboundedEnabled = chunkedUnboundedEnabled,
+            preferPostVideoPlayback = preferPostVideoPlayback,
+            defaultHeaders = defaultHeaders
+        )
     }
 
+    private var baseStreamUrl: String = ""
+    private var mergedHeaders: Map<String, String> = emptyMap()
     private var currentUri: Uri? = null
-    private var connection: HttpURLConnection? = null
-    private var inputStream: InputStream? = null
+    private var activeStream: OpenedYoutubeStream? = null
+
     private var opened = false
-    private var bytesToRead: Long = 0L
+    private var isChunkedMode = false
+    private var startPosition: Long = 0L
+    private var bytesToRead: Long = C.LENGTH_UNSET.toLong()
     private var bytesRead: Long = 0L
+    private var currentChunkRemaining: Long = 0L
 
     override fun open(dataSpec: DataSpec): Long {
         transferInitializing(dataSpec)
+        baseStreamUrl = dataSpec.uri.toString()
+        mergedHeaders = defaultHeaders + dataSpec.httpRequestHeaders
+        startPosition = dataSpec.position
         bytesRead = 0L
-        bytesToRead = 0L
+        bytesToRead = C.LENGTH_UNSET.toLong()
+        currentChunkRemaining = 0L
 
-        val conn = openYoutubeConnection(dataSpec)
-        connection = conn
-        currentUri = Uri.parse(conn.url.toString())
+        val isVideoPlayback = runCatching {
+            URL(baseStreamUrl).path.startsWith("/videoplayback")
+        }.getOrDefault(false)
 
-        val responseCode = conn.responseCode
-        if (responseCode < 200 || responseCode > 299) {
-            val errMsg = conn.responseMessage
-            closeConnectionQuietly()
-            throw IOException("YouTube stream HTTP $responseCode ($errMsg)")
-        }
-
-        val positionToSkip = if (!rangeParameterEnabled && responseCode == 200 && dataSpec.position > 0L) {
-            dataSpec.position
-        } else {
-            0L
-        }
-
-        bytesToRead = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-            dataSpec.length
-        } else {
-            val contentLen = conn.contentLengthLong
-            if (contentLen != -1L) (contentLen - positionToSkip).coerceAtLeast(0L)
-            else C.LENGTH_UNSET.toLong()
-        }
+        val useChunkedProgressive =
+            isVideoPlayback &&
+                chunkedUnboundedEnabled &&
+                dataSpec.length == C.LENGTH_UNSET.toLong()
 
         try {
-            inputStream = conn.inputStream
-            if (positionToSkip > 0L) {
-                skipFully(positionToSkip)
+            if (useChunkedProgressive) {
+                val knownClen = YoutubeHttpEngine.parseClenFromUrl(baseStreamUrl)
+                val firstChunkLen = if (knownClen > 0L) {
+                    min(CHUNK_SIZE_BYTES, (knownClen - startPosition).coerceAtLeast(1L))
+                } else {
+                    CHUNK_SIZE_BYTES
+                }
+
+                val firstOpened = YoutubeHttpEngine.openRange(
+                    rawUrl = baseStreamUrl,
+                    position = startPosition,
+                    length = firstChunkLen,
+                    rangeParameterEnabled = true,
+                    rnParameterEnabled = rnParameterEnabled,
+                    customHeaders = mergedHeaders,
+                    preferPost = preferPostVideoPlayback
+                )
+                activeStream = firstOpened
+                currentUri = Uri.parse(firstOpened.finalUrl)
+
+                val totalLen = firstOpened.totalResourceLength
+                if (totalLen > startPosition) {
+                    isChunkedMode = true
+                    bytesToRead = totalLen - startPosition
+                    currentChunkRemaining = if (firstOpened.contentLength > 0L) {
+                        min(firstOpened.contentLength, bytesToRead)
+                    } else {
+                        min(firstChunkLen, bytesToRead)
+                    }
+                } else {
+                    // Server did not report total size; read stream normally
+                    isChunkedMode = false
+                    bytesToRead = if (firstOpened.contentLength > 0L) {
+                        firstOpened.contentLength
+                    } else {
+                        C.LENGTH_UNSET.toLong()
+                    }
+                }
+            } else {
+                isChunkedMode = false
+                val reqLength = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
+                    dataSpec.length
+                } else {
+                    -1L
+                }
+                val stream = YoutubeHttpEngine.openRange(
+                    rawUrl = baseStreamUrl,
+                    position = startPosition,
+                    length = reqLength,
+                    rangeParameterEnabled = rangeParameterEnabled,
+                    rnParameterEnabled = rnParameterEnabled,
+                    customHeaders = mergedHeaders,
+                    preferPost = preferPostVideoPlayback
+                )
+                activeStream = stream
+                currentUri = Uri.parse(stream.finalUrl)
+                bytesToRead = when {
+                    dataSpec.length != C.LENGTH_UNSET.toLong() -> dataSpec.length
+                    stream.contentLength > 0L -> stream.contentLength
+                    else -> C.LENGTH_UNSET.toLong()
+                }
             }
-        } catch (e: IOException) {
-            closeConnectionQuietly()
-            throw e
+        } catch (e: Exception) {
+            closeActiveStreamQuietly()
+            throw if (e is IOException) e else IOException("Stream open error: ${e.message}", e)
         }
 
         opened = true
@@ -86,34 +147,78 @@ class YoutubeMedia3DataSource(
 
     override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
-        if (bytesToRead != C.LENGTH_UNSET.toLong()) {
-            val remaining = bytesToRead - bytesRead
-            if (remaining == 0L) return C.RESULT_END_OF_INPUT
-        }
-        val toRead = if (bytesToRead == C.LENGTH_UNSET.toLong()) {
-            length
-        } else {
-            min(length.toLong(), bytesToRead - bytesRead).toInt()
-        }
-
-        val stream = inputStream ?: return C.RESULT_END_OF_INPUT
-        val readCount = stream.read(buffer, offset, toRead)
-        if (readCount == -1) {
+        if (bytesToRead != C.LENGTH_UNSET.toLong() && bytesRead >= bytesToRead) {
             return C.RESULT_END_OF_INPUT
         }
-        bytesRead += readCount
-        bytesTransferred(readCount)
-        return readCount
+
+        if (isChunkedMode && currentChunkRemaining <= 0L) {
+            openNextChunk()
+        }
+
+        val stream = activeStream?.bodyStream ?: return C.RESULT_END_OF_INPUT
+        val maxWanted = when {
+            isChunkedMode -> min(length.toLong(), currentChunkRemaining).toInt()
+            bytesToRead != C.LENGTH_UNSET.toLong() -> min(length.toLong(), bytesToRead - bytesRead).toInt()
+            else -> length
+        }
+
+        val count = stream.read(buffer, offset, maxWanted)
+        if (count == -1) {
+            if (isChunkedMode && bytesToRead != C.LENGTH_UNSET.toLong() && bytesRead < bytesToRead) {
+                currentChunkRemaining = 0L
+                openNextChunk()
+                val retryStream = activeStream?.bodyStream ?: return C.RESULT_END_OF_INPUT
+                val retryMax = min(length.toLong(), currentChunkRemaining).toInt()
+                val retryCount = retryStream.read(buffer, offset, retryMax)
+                if (retryCount == -1) return C.RESULT_END_OF_INPUT
+                bytesRead += retryCount
+                currentChunkRemaining -= retryCount
+                bytesTransferred(retryCount)
+                return retryCount
+            }
+            return C.RESULT_END_OF_INPUT
+        }
+
+        bytesRead += count
+        if (isChunkedMode) {
+            currentChunkRemaining -= count
+        }
+        bytesTransferred(count)
+        return count
+    }
+
+    private fun openNextChunk() {
+        closeActiveStreamQuietly()
+        val nextOffset = startPosition + bytesRead
+        val remainingTotal = (bytesToRead - bytesRead).coerceAtLeast(0L)
+        if (remainingTotal <= 0L) return
+
+        val nextLen = min(CHUNK_SIZE_BYTES, remainingTotal)
+        val nextOpened = YoutubeHttpEngine.openRange(
+            rawUrl = baseStreamUrl,
+            position = nextOffset,
+            length = nextLen,
+            rangeParameterEnabled = true,
+            rnParameterEnabled = rnParameterEnabled,
+            customHeaders = mergedHeaders,
+            preferPost = preferPostVideoPlayback
+        )
+        activeStream = nextOpened
+        currentUri = Uri.parse(nextOpened.finalUrl)
+        currentChunkRemaining = if (nextOpened.contentLength > 0L) {
+            min(nextOpened.contentLength, remainingTotal)
+        } else {
+            nextLen
+        }
     }
 
     override fun getUri(): Uri? = currentUri
 
     override fun close() {
         try {
-            inputStream?.let { runCatching { it.close() } }
+            closeActiveStreamQuietly()
         } finally {
-            inputStream = null
-            closeConnectionQuietly()
+            currentUri = null
             if (opened) {
                 opened = false
                 transferEnded()
@@ -121,105 +226,12 @@ class YoutubeMedia3DataSource(
         }
     }
 
-    private fun openYoutubeConnection(dataSpec: DataSpec): HttpURLConnection {
-        var requestUrl = dataSpec.uri.toString()
-        val parsed = URL(requestUrl)
-        val isVideoPlayback = parsed.path.startsWith("/videoplayback")
-
-        if (isVideoPlayback && rnParameterEnabled && !requestUrl.contains("&rn=")) {
-            requestUrl += "&rn=${requestCounter.getAndIncrement()}"
-        }
-
-        if (isVideoPlayback && rangeParameterEnabled) {
-            buildRangeQueryParam(dataSpec.position, dataSpec.length)?.let { rangeParam ->
-                if (!requestUrl.contains("&range=")) {
-                    requestUrl += rangeParam
-                }
-            }
-        }
-
-        val conn = (URL(requestUrl).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 20_000
-            readTimeout = 25_000
-            instanceFollowRedirects = true
-        }
-
-        dataSpec.httpRequestHeaders.forEach { (k, v) ->
-            conn.setRequestProperty(k, v)
-        }
-
-        if (!rangeParameterEnabled || !isVideoPlayback) {
-            if (dataSpec.position > 0L || dataSpec.length != C.LENGTH_UNSET.toLong()) {
-                val endPart = if (dataSpec.length != C.LENGTH_UNSET.toLong()) {
-                    (dataSpec.position + dataSpec.length - 1L).toString()
-                } else ""
-                conn.setRequestProperty("Range", "bytes=${dataSpec.position}-$endPart")
-            }
-        }
-
-        if (YoutubeParsingHelper.isWebStreamingUrl(requestUrl)) {
-            conn.setRequestProperty("Origin", YOUTUBE_ORIGIN)
-            conn.setRequestProperty("Referer", YOUTUBE_ORIGIN)
-            conn.setRequestProperty("Sec-Fetch-Dest", "empty")
-            conn.setRequestProperty("Sec-Fetch-Mode", "cors")
-            conn.setRequestProperty("Sec-Fetch-Site", "cross-site")
-        }
-
-        val ua = if (YoutubeParsingHelper.isVisionOsStreamingUrl(requestUrl)) {
-            YoutubeParsingHelper.getVisionOsUserAgent(null)
-        } else {
-            NewPipeOkHttpDownloader.USER_AGENT
-        }
-        conn.setRequestProperty("User-Agent", ua)
-        conn.setRequestProperty("TE", "trailers")
-        conn.setRequestProperty("Accept-Encoding", "identity")
-
-        if (isVideoPlayback) {
-            conn.requestMethod = "POST"
-            conn.doOutput = true
-            conn.setFixedLengthStreamingMode(POST_BODY.size)
-            conn.connect()
-            conn.outputStream.use { os ->
-                os.write(POST_BODY)
-            }
-        } else {
-            conn.requestMethod = "GET"
-            conn.connect()
-        }
-
-        return conn
-    }
-
-    private fun buildRangeQueryParam(position: Long, length: Long): String? {
-        if (position == 0L && length == C.LENGTH_UNSET.toLong()) return null
-        val sb = StringBuilder("&range=").append(position).append("-")
-        if (length != C.LENGTH_UNSET.toLong()) {
-            sb.append(position + length - 1L)
-        }
-        return sb.toString()
-    }
-
-    private fun skipFully(bytesToSkip: Long) {
-        val stream = inputStream ?: return
-        var remaining = bytesToSkip
-        val skipBuf = ByteArray(4096)
-        while (remaining > 0L) {
-            val readLen = min(remaining, skipBuf.size.toLong()).toInt()
-            val r = stream.read(skipBuf, 0, readLen)
-            if (r == -1) throw IOException("EOF while skipping stream bytes")
-            remaining -= r
-            bytesTransferred(r)
-        }
-    }
-
-    private fun closeConnectionQuietly() {
-        connection?.let { runCatching { it.disconnect() } }
-        connection = null
+    private fun closeActiveStreamQuietly() {
+        activeStream?.close()
+        activeStream = null
     }
 
     companion object {
-        private const val YOUTUBE_ORIGIN = "https://www.youtube.com"
-        private val POST_BODY = byteArrayOf(0x78, 0)
-        private val requestCounter = AtomicInteger(1)
+        private const val CHUNK_SIZE_BYTES = 512L * 1024L // 512 KB fast anti-throttle chunks
     }
 }

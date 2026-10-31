@@ -31,8 +31,8 @@ class NewPipeOkHttpDownloader private constructor(
             .method(httpMethod, requestBody)
             .header("User-Agent", USER_AGENT)
 
-        if (url.contains("youtube.com")) {
-            builder.header("Cookie", "CONSENT=PENDING+987; SOCS=CAESEwgDEgk0ODE3Nzk3MjQaAmVuIAEaBgiA_LyaBg")
+        if (url.contains("consent.youtube.com")) {
+            builder.header("Cookie", "SOCS=CAE=")
         }
 
         headers.forEach { (name, values) ->
@@ -60,7 +60,7 @@ class NewPipeOkHttpDownloader private constructor(
 
     companion object {
         const val USER_AGENT =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:136.0) Gecko/20100101 Firefox/136.0"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:153.0) Gecko/20100101 Firefox/153.0"
 
         @Volatile
         private var instance: NewPipeOkHttpDownloader? = null

@@ -15,9 +15,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
-import org.schabi.newpipe.extractor.services.youtube.YoutubeParsingHelper
 import java.io.File
 import java.io.FileOutputStream
 
@@ -51,14 +48,25 @@ class OfflineDownloadManager(
         scope.launch {
             val ytUrl = track.youtubeUrl.ifBlank { "https://www.youtube.com/watch?v=${track.id}" }
 
-            // Strategy 1: High-speed chunked stream download via resolved NewPipe stream
+            // Strategy 1: High-speed 512 KB chunked stream download via redirect-safe YoutubeHttpEngine
             val fastSuccess = runCatching {
                 val resolved = youtubeRepo.resolvePlaybackStream(track, preferHighQuality = true).getOrThrow()
-                if (resolved.isHls) error("HLS stream requires yt-dlp muxer")
+                val directCandidate = resolved.candidates.firstOrNull { !it.isHls }
+                    ?: if (!resolved.isHls) null else error("HLS stream requires yt-dlp muxer")
 
-                val ext = if (resolved.mimeType?.contains("webm") == true) "webm" else "m4a"
+                val streamUrl = directCandidate?.streamUrl ?: resolved.streamUrl
+                val mime = directCandidate?.mimeType ?: resolved.mimeType
+                val headers = directCandidate?.headers ?: resolved.headers
+                val preferPost = directCandidate?.preferPostVideoPlayback ?: resolved.preferPostVideoPlayback
+
+                val ext = if (mime?.contains("webm") == true) "webm" else "m4a"
                 val destFile = File(songsDir, "${track.id}.$ext")
-                downloadChunkedAudio(resolved.streamUrl, destFile) { pct ->
+                downloadChunkedAudio(
+                    streamUrl = streamUrl,
+                    headers = headers,
+                    preferPost = preferPost,
+                    destFile = destFile
+                ) { pct ->
                     _tasks.update { map ->
                         val cur = map[track.id] ?: return@update map
                         map + (track.id to cur.copy(
@@ -84,7 +92,7 @@ class OfflineDownloadManager(
                         title = track.title,
                         thumbnailUrl = track.thumbnailUrl,
                         progress = 100f,
-                        statusText = "Saved Offline (${file.length() / 1024 / 1024} MB)",
+                        statusText = "Saved Offline (${(file.length() / 1024.0 / 1024.0).let { String.format("%.1f", it) }} MB)",
                         isCompleted = true
                     ))
                 }
@@ -149,62 +157,48 @@ class OfflineDownloadManager(
 
     private fun downloadChunkedAudio(
         streamUrl: String,
+        headers: Map<String, String>,
+        preferPost: Boolean,
         destFile: File,
         onProgress: (Float) -> Unit
     ) {
-        val client = NewPipeOkHttpDownloader.getInstance().okHttpClient
-        val userAgent = if (YoutubeParsingHelper.isVisionOsStreamingUrl(streamUrl)) {
-            YoutubeParsingHelper.getVisionOsUserAgent(null)
-        } else {
-            NewPipeOkHttpDownloader.USER_AGENT
-        }
-        val chunkSize = 512 * 1024L // 512 KB range chunks to bypass YouTube throttling
+        val chunkSize = 512L * 1024L
         val tmpFile = File(destFile.parentFile, "${destFile.name}.part")
         if (tmpFile.exists()) tmpFile.delete()
+        if (destFile.exists()) destFile.delete()
 
         var downloaded = 0L
-        var totalLength = -1L
-        var rn = 1
+        var totalLength = YoutubeHttpEngine.parseClenFromUrl(streamUrl)
 
         FileOutputStream(tmpFile).use { fos ->
             while (true) {
-                val endByte = downloaded + chunkSize - 1
-                val isVideoPlayback = streamUrl.contains("/videoplayback")
-                val chunkUrl = if (isVideoPlayback) {
-                    "$streamUrl&rn=$rn&range=$downloaded-$endByte"
+                val requestLen = if (totalLength > 0L) {
+                    minOf(chunkSize, (totalLength - downloaded).coerceAtLeast(1L))
                 } else {
-                    streamUrl
-                }
-                rn++
-
-                val reqBuilder = Request.Builder()
-                    .url(chunkUrl)
-                    .header("User-Agent", userAgent)
-
-                if (!isVideoPlayback) {
-                    reqBuilder.header("Range", "bytes=$downloaded-$endByte")
-                } else {
-                    reqBuilder.post(byteArrayOf(0x78, 0).toRequestBody(null))
+                    chunkSize
                 }
 
-                client.newCall(reqBuilder.build()).execute().use { resp ->
-                    if (!resp.isSuccessful && resp.code != 206) {
-                        error("HTTP ${resp.code}")
+                YoutubeHttpEngine.openRange(
+                    rawUrl = streamUrl,
+                    position = downloaded,
+                    length = requestLen,
+                    rangeParameterEnabled = true,
+                    rnParameterEnabled = true,
+                    customHeaders = headers,
+                    preferPost = preferPost
+                ).use { opened ->
+                    if (totalLength <= 0L && opened.totalResourceLength > 0L) {
+                        totalLength = opened.totalResourceLength
                     }
-                    if (totalLength <= 0L) {
-                        val contentRange = resp.header("Content-Range")
-                        totalLength = contentRange?.substringAfter("/", "")?.toLongOrNull()
-                            ?: streamUrl.substringAfter("clen=", "").substringBefore("&").toLongOrNull()
-                            ?: -1L
+                    val buf = ByteArray(32 * 1024)
+                    var chunkBytes = 0L
+                    while (true) {
+                        val n = opened.bodyStream.read(buf)
+                        if (n == -1) break
+                        fos.write(buf, 0, n)
+                        downloaded += n
+                        chunkBytes += n
                     }
-                    val body = resp.body ?: error("Empty body")
-                    val bytes = body.bytes()
-                    if (bytes.isEmpty()) {
-                        tmpFile.renameTo(destFile)
-                        return
-                    }
-                    fos.write(bytes)
-                    downloaded += bytes.size
 
                     if (totalLength > 0L) {
                         onProgress((downloaded.toFloat() / totalLength.toFloat() * 100f).coerceIn(2f, 99f))
@@ -215,7 +209,7 @@ class OfflineDownloadManager(
                         }
                     }
 
-                    if (!isVideoPlayback || bytes.size < 1024) {
+                    if (chunkBytes <= 0L || (totalLength <= 0L && chunkBytes < requestLen)) {
                         fos.flush()
                         tmpFile.renameTo(destFile)
                         return

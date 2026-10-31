@@ -35,6 +35,22 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x ./gradlew
 
+      - name: Verify Live Multi-Song YouTube Search & Audio Streaming
+        run: |
+          set +e
+          ./gradlew testReleaseUnitTest --info --no-daemon > test.log 2>&1
+          STATUS=$?
+          cat test.log
+          LIVE_LINES=$(grep -E "LIVE TEST" test.log | tr '\n' ' ' | cut -c1-3500)
+          if [ -n "$LIVE_LINES" ]; then
+            echo "::notice title=LiveYouTubeSummary::$LIVE_LINES"
+          fi
+          if [ $STATUS -ne 0 ]; then
+            SUMMARY_ERR=$(grep -E "^e: |LIVE TEST|AssertionError|FAILED|What went wrong|^> |Unresolved" -A 2 test.log | tail -n 45 | tr '\n' ' ' | cut -c1-3500)
+            echo "::error title=LiveTestFailure::$SUMMARY_ERR"
+            exit $STATUS
+          fi
+
       - name: Generate Release Signing Keystore
         run: |
           keytool -genkeypair -v \
@@ -66,7 +82,7 @@ jobs:
 
       - name: Inspect Built APKs & Sizes
         run: |
-          echo "### PulseWave Music Built APKs" >> "$GITHUB_STEP_SUMMARY"
+          echo "### PulseWave Music v1.1.0 Built APKs" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| File | Size |" >> "$GITHUB_STEP_SUMMARY"
           echo "| :--- | :--- |" >> "$GITHUB_STEP_SUMMARY"
@@ -80,37 +96,35 @@ jobs:
       - name: Upload Signed APKs as Workflow Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: PulseWave-Music-Signed-APKs
+          name: PulseWave-Music-v1.1.0-Signed-APKs
           path: app/build/outputs/apk/release/*.apk
           if-no-files-found: error
 
-      - name: Publish APKs to GitHub Releases (v1.0.0)
+      - name: Publish APKs to GitHub Releases (v1.1.0)
         if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v1.0.0"
-          NOTES="## PulseWave Music v1.0.0 — Native Android YouTube Music Player
+          TAG="v1.1.0"
+          NOTES="## PulseWave Music v1.1.0 — Multi-Client YouTube Streaming Fix & Queue Upgrade
 
-          - **100% Native Kotlin + Jetpack Compose + Media3 ExoPlayer** (Zero WebView, Zero Login, Zero Cloud Database)
-          - **Ad-Free YouTube & YT Music Audio Streaming** via Dual-Engine Extractor (**NewPipe VisionOS Progressive DASH** + **Embedded Python yt-dlp + FFmpeg**)
-          - **Background & Lockscreen Playback** with Bluetooth Earphone controls
-          - **Offline Song Downloader** (Save songs locally in M4A/WebM for zero-internet playback)
-          - **Pro Audio Studio**: Hardware 5-Band Equalizer, Sub-Bass Boost, 3D Virtualizer, Loudness Enhancer & **Slowed + Reverb / Nightcore Speed & Pitch**
-          - **Time-Synced Lyrics** powered by LRCLIB
-          - **Offline Ambient Soundscape Mixer**: Layer Midnight Rain, Warm Vinyl Crackle, Ocean Surf, Distant Thunder & Dream Pad underneath any YouTube song!
+          ### What's Fixed in v1.1.0
+          - **Fixed YouTube Multi-Song Streaming (HTTP 302 ISP Redirect Fix)**: Replaced Android \`HttpURLConnection\` with a custom **OkHttp Multi-Hop Redirect & 512 KB Anti-Throttle Range Engine** that preserves \`POST\` / \`GET\` across YouTube CDN edge redirects on Jio, Airtel, Vi & Wi-Fi.
+          - **4-Layer Multi-Client YouTube Audio Extractor**: Combines **NewPipe VisionOS Progressive DASH**, **Direct InnerTube (VisionOS 1.02 Music + Android VR + iOS HLS)**, **Piped Cloud Mirror**, and **Auto-Updated Nightly yt-dlp + FFmpeg** with automatic pre-flight verification & instant failover.
+          - **Seamless Queue & Auto-Radio Playback**: Removed \`SimpleCache\` signed-URL collisions, fixed single-track loop lock, and added automatic failover/skip so queues play continuously song after song.
+          - **100% Native Kotlin + Jetpack Compose + Media3 ExoPlayer** (Zero WebView, Zero Login, Zero Database)
 
           ### Which APK should I install?
-          - **Recommended for almost all phones (64-bit Android):** \`PulseWave-v1.0.0-arm64-v8a-release.apk\`
-          - **Older 32-bit Android phones:** \`PulseWave-v1.0.0-armeabi-v7a-release.apk\`
-          - **Universal (All CPU architectures):** \`PulseWave-v1.0.0-universal-release.apk\`"
+          - **Recommended for almost all phones (64-bit Android):** \`PulseWave-v1.1.0-arm64-v8a-release.apk\`
+          - **Older 32-bit Android phones:** \`PulseWave-v1.1.0-armeabi-v7a-release.apk\`
+          - **Universal (All CPU architectures):** \`PulseWave-v1.1.0-universal-release.apk\`"
 
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" app/build/outputs/apk/release/*.apk --clobber
-            gh release edit "$TAG" --title "PulseWave Music v1.0.0 (Signed Android APKs)" --notes "$NOTES"
+            gh release edit "$TAG" --title "PulseWave Music v1.1.0 (Signed Android APKs)" --notes "$NOTES"
           else
             gh release create "$TAG" app/build/outputs/apk/release/*.apk \
               --target "${{ github.sha }}" \
-              --title "PulseWave Music v1.0.0 (Signed Android APKs)" \
+              --title "PulseWave Music v1.1.0 (Signed Android APKs)" \
               --notes "$NOTES"
           fi
