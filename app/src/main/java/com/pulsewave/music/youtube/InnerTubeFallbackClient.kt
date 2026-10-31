@@ -112,8 +112,14 @@ object InnerTubeFallbackClient {
     )
 
     private val pipedInstances = listOf(
-        "https://pipedapi.kavin.rocks",
-        "https://pipedapi-libre.kavin.rocks"
+        "https://pipedapi.leptons.xyz",
+        "https://pipedapi.kavin.rocks"
+    )
+
+    private val invidiousInstances = listOf(
+        "https://inv.nadeko.net",
+        "https://invidious.nerdvpn.de",
+        "https://invidious.tiekoetter.com"
     )
 
     data class FallbackExtractResult(
@@ -289,6 +295,50 @@ object InnerTubeFallbackClient {
                                     preferPostVideoPlayback = false
                                 )
                             )
+                        }
+                    }
+                }
+                if (collected.isNotEmpty()) break
+            }
+        }
+
+        // Active Invidious proxied audio fallback (?local=true proxies audio through mirror edge)
+        if (collected.isEmpty()) {
+            for (inv in invidiousInstances) {
+                runCatching {
+                    val req = Request.Builder()
+                        .url("$inv/api/v1/videos/$videoId")
+                        .header("User-Agent", NewPipeOkHttpDownloader.USER_AGENT)
+                        .get()
+                        .build()
+                    NewPipeOkHttpDownloader.getInstance().okHttpClient.newCall(req).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use
+                        val raw = resp.body?.string() ?: return@use
+                        val obj = jsonParser.parseToJsonElement(raw).jsonObject
+                        if (detectedDurationSec == 0L) {
+                            detectedDurationSec = obj["lengthSeconds"]?.jsonPrimitive?.longOrNull ?: 0L
+                        }
+                        val adaptive = runCatching { obj["adaptiveFormats"]?.jsonArray }.getOrNull()
+                        if (adaptive != null) {
+                            for (el in adaptive) {
+                                val fmt = runCatching { el.jsonObject }.getOrNull() ?: continue
+                                val type = fmt.str("type") ?: ""
+                                if (!type.startsWith("audio/")) continue
+                                val itag = fmt.str("itag") ?: "140"
+                                val br = ((fmt.str("bitrate")?.toIntOrNull() ?: 128_000) / 1000).coerceAtLeast(64)
+                                // Local proxied URL bypasses client IP / BotGuard restrictions
+                                val proxiedUrl = "$inv/latest_version?id=$videoId&itag=$itag&local=true"
+                                collected.add(
+                                    StreamCandidate(
+                                        streamUrl = proxiedUrl,
+                                        isHls = false,
+                                        mimeType = type.substringBefore(";"),
+                                        bitrate = br,
+                                        engineLabel = "YT Cloud Edge (${br}kbps)",
+                                        preferPostVideoPlayback = false
+                                    )
+                                )
+                            }
                         }
                     }
                 }

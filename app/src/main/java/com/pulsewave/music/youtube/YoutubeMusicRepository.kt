@@ -268,7 +268,29 @@ class YoutubeMusicRepository {
             }
         }
 
-        // Engine 3: Embedded yt-dlp Python runtime fallback (Android runtime)
+        // Engine 3: 320 kbps Studio AAC M4A Mirror Resolver (bypasses CGNAT / BotGuard / label blocks)
+        if (verifiedPrimary == null) {
+            runCatching {
+                val mirror = StudioAudioMirrorClient.resolveMirrorCandidates(
+                    track = track,
+                    preferHighQuality = preferHighQuality
+                )
+                if (mirror.durationSec > 0L && resolvedDurationSec <= 0L) {
+                    resolvedDurationSec = mirror.durationSec
+                }
+                val newCandidates = mirror.candidates.filterNot { c ->
+                    allCandidates.any { existing -> existing.streamUrl == c.streamUrl }
+                }
+                allCandidates.addAll(newCandidates)
+                verifiedPrimary = newCandidates
+                    .take(4)
+                    .firstOrNull { YoutubeHttpEngine.probeCandidate(it) }
+            }.onFailure { e ->
+                errors.add("StudioMirror: ${e.message}")
+            }
+        }
+
+        // Engine 4: Embedded yt-dlp Python runtime fallback (Android runtime)
         if (verifiedPrimary == null && allowYtDlp) {
             runCatching {
                 val ytdlCandidate = extractYtDlpCandidate(ytUrl, preferHighQuality)
@@ -281,6 +303,15 @@ class YoutubeMusicRepository {
             }.onFailure { e ->
                 errors.add("yt-dlp: ${e.message}")
             }
+        }
+
+        // Ensure Endless Auto-Radio always has related tracks even if NewPipe watch page was blocked
+        if (relatedTracks.isEmpty() && track.artist.isNotBlank()) {
+            relatedTracks = runCatching {
+                searchTracks("${track.artist} top songs", SearchFilter.MUSIC_SONGS)
+                    .filterNot { it.id == track.id }
+                    .take(14)
+            }.getOrDefault(emptyList())
         }
 
         val chosen = verifiedPrimary ?: allCandidates.firstOrNull()
