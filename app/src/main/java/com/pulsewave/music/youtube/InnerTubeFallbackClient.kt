@@ -1,9 +1,17 @@
 package com.pulsewave.music.youtube
 
-import com.grack.nanojson.JsonObject
-import com.grack.nanojson.JsonParser
-import com.grack.nanojson.JsonWriter
 import com.pulsewave.music.model.StreamCandidate
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
+import kotlinx.serialization.json.put
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -11,8 +19,13 @@ import java.security.SecureRandom
 
 object InnerTubeFallbackClient {
 
+    private val jsonParser = Json {
+        ignoreUnknownKeys = true
+        isLenient = true
+    }
+
     private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-    private val NONCE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+    private const val NONCE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     private val random = SecureRandom()
 
     @Volatile
@@ -108,6 +121,12 @@ object InnerTubeFallbackClient {
         val durationSec: Long
     )
 
+    private fun JsonObject.str(key: String): String? =
+        this[key]?.jsonPrimitive?.contentOrNull
+
+    private fun JsonObject.obj(key: String): JsonObject? =
+        runCatching { this[key]?.jsonObject }.getOrNull()
+
     fun extractCandidates(
         videoId: String,
         countryCode: String = "IN",
@@ -120,20 +139,20 @@ object InnerTubeFallbackClient {
         for (profile in profiles) {
             runCatching {
                 val respObj = queryProfile(profile, videoId, countryCode, visitorData) ?: return@runCatching
-                val status = respObj.getObject("playabilityStatus")?.getString("status")
+                val status = respObj.obj("playabilityStatus")?.str("status")
                 if (!status.equals("OK", ignoreCase = true)) return@runCatching
 
-                val videoDetails = respObj.getObject("videoDetails")
+                val videoDetails = respObj.obj("videoDetails")
                 if (videoDetails != null) {
-                    val returnedId = videoDetails.getString("videoId")
+                    val returnedId = videoDetails.str("videoId")
                     if (!returnedId.isNullOrBlank() && returnedId != videoId) return@runCatching
-                    val lenSec = videoDetails.getString("lengthSeconds")?.toLongOrNull() ?: 0L
+                    val lenSec = videoDetails.str("lengthSeconds")?.toLongOrNull() ?: 0L
                     if (lenSec > 0L && detectedDurationSec == 0L) {
                         detectedDurationSec = lenSec
                     }
                 }
 
-                val streamingData = respObj.getObject("streamingData") ?: return@runCatching
+                val streamingData = respObj.obj("streamingData") ?: return@runCatching
                 val headers = buildMap {
                     put("User-Agent", profile.userAgent)
                     profile.origin?.let {
@@ -144,15 +163,18 @@ object InnerTubeFallbackClient {
 
                 val profileAudioCandidates = mutableListOf<StreamCandidate>()
 
-                val adaptive = streamingData.getArray("adaptiveFormats")
+                val adaptive = runCatching { streamingData["adaptiveFormats"]?.jsonArray }.getOrNull()
                 if (adaptive != null) {
-                    for (i in 0 until adaptive.size) {
-                        val fmt = adaptive.getObject(i) ?: continue
-                        val url = fmt.getString("url")?.takeIf { it.startsWith("http") } ?: continue
-                        val mimeType = fmt.getString("mimeType") ?: ""
+                    for (element in adaptive) {
+                        val fmt = runCatching { element.jsonObject }.getOrNull() ?: continue
+                        val url = fmt.str("url")?.takeIf { u -> u.startsWith("http") } ?: continue
+                        val mimeType = fmt.str("mimeType") ?: ""
                         if (!mimeType.startsWith("audio/")) continue
-                        val bitrate = fmt.getInt("averageBitrate", fmt.getInt("bitrate", 128_000)) / 1000
-                        val clen = fmt.getString("contentLength")?.toLongOrNull() ?: -1L
+                        val avgBr = fmt["averageBitrate"]?.jsonPrimitive?.intOrNull
+                            ?: fmt["bitrate"]?.jsonPrimitive?.intOrNull
+                            ?: 128_000
+                        val bitrate = (avgBr / 1000).coerceAtLeast(48)
+                        val clen = fmt.str("contentLength")?.toLongOrNull() ?: -1L
                         profileAudioCandidates.add(
                             StreamCandidate(
                                 streamUrl = url,
@@ -176,14 +198,14 @@ object InnerTubeFallbackClient {
                 }
                 collected.addAll(sortedAudio.take(2))
 
-                // Also grab muxed progressive audio/video (itag 18) as backup if adaptive fails
-                val muxed = streamingData.getArray("formats")
+                // Muxed progressive backup (itag 18 AAC)
+                val muxed = runCatching { streamingData["formats"]?.jsonArray }.getOrNull()
                 if (muxed != null) {
-                    for (i in 0 until muxed.size) {
-                        val fmt = muxed.getObject(i) ?: continue
-                        val url = fmt.getString("url")?.takeIf { it.startsWith("http") } ?: continue
-                        val mimeType = fmt.getString("mimeType") ?: "video/mp4"
-                        val clen = fmt.getString("contentLength")?.toLongOrNull() ?: -1L
+                    for (element in muxed) {
+                        val fmt = runCatching { element.jsonObject }.getOrNull() ?: continue
+                        val url = fmt.str("url")?.takeIf { u -> u.startsWith("http") } ?: continue
+                        val mimeType = fmt.str("mimeType") ?: "video/mp4"
+                        val clen = fmt.str("contentLength")?.toLongOrNull() ?: -1L
                         collected.add(
                             StreamCandidate(
                                 streamUrl = url,
@@ -200,9 +222,9 @@ object InnerTubeFallbackClient {
                     }
                 }
 
-                // Also grab HLS manifest if present
-                val hlsUrl = streamingData.getString("hlsManifestUrl")
-                if (!hlsUrl.isNullOrBlank()) {
+                // HLS manifest backup
+                val hlsUrl = streamingData.str("hlsManifestUrl")
+                if (!hlsUrl.isNullOrBlank() && hlsUrl.startsWith("http")) {
                     collected.add(
                         StreamCandidate(
                             streamUrl = hlsUrl,
@@ -217,11 +239,10 @@ object InnerTubeFallbackClient {
                 }
             }
 
-            // Stop querying additional profiles early once we already have playable direct candidates
             if (collected.size >= 3) break
         }
 
-        // If direct InnerTube yielded nothing, check Piped public mirrors as final emergency backup
+        // Emergency backup via Piped public mirrors
         if (collected.isEmpty()) {
             for (mirror in pipedInstances) {
                 runCatching {
@@ -233,30 +254,30 @@ object InnerTubeFallbackClient {
                     NewPipeOkHttpDownloader.getInstance().okHttpClient.newCall(req).execute().use { resp ->
                         if (!resp.isSuccessful) return@use
                         val raw = resp.body?.string() ?: return@use
-                        val obj = JsonParser.`object`().from(raw)
+                        val obj = jsonParser.parseToJsonElement(raw).jsonObject
                         if (detectedDurationSec == 0L) {
-                            detectedDurationSec = obj.getLong("duration", 0L)
+                            detectedDurationSec = obj["duration"]?.jsonPrimitive?.longOrNull ?: 0L
                         }
-                        val audioArr = obj.getArray("audioStreams")
+                        val audioArr = runCatching { obj["audioStreams"]?.jsonArray }.getOrNull()
                         if (audioArr != null) {
-                            for (i in 0 until audioArr.size) {
-                                val a = audioArr.getObject(i) ?: continue
-                                val u = a.getString("url")?.takeIf { it.startsWith("http") } ?: continue
-                                val br = a.getInt("bitrate", 128_000) / 1000
-                                val mt = a.getString("mimeType") ?: "audio/mp4"
+                            for (el in audioArr) {
+                                val a = runCatching { el.jsonObject }.getOrNull() ?: continue
+                                val u = a.str("url")?.takeIf { s -> s.startsWith("http") } ?: continue
+                                val br = ((a["bitrate"]?.jsonPrimitive?.intOrNull ?: 128_000) / 1000).coerceAtLeast(64)
+                                val mt = a.str("mimeType") ?: "audio/mp4"
                                 collected.add(
                                     StreamCandidate(
                                         streamUrl = u,
                                         isHls = false,
                                         mimeType = mt,
-                                        bitrate = br.coerceAtLeast(64),
-                                        engineLabel = "Piped Cloud (${br.coerceAtLeast(64)}kbps)",
+                                        bitrate = br,
+                                        engineLabel = "Piped Cloud (${br}kbps)",
                                         preferPostVideoPlayback = false
                                     )
                                 )
                             }
                         }
-                        val hls = obj.getString("hls")
+                        val hls = obj.str("hls")
                         if (!hls.isNullOrBlank() && hls.startsWith("http")) {
                             collected.add(
                                 StreamCandidate(
@@ -288,39 +309,34 @@ object InnerTubeFallbackClient {
         visitorData: String?
     ): JsonObject? {
         val cpn = generateCpn()
-        val clientBuilder = JsonWriter.string()
-            .`object`()
-            .`object`("context")
-            .`object`("client")
-            .value("clientName", profile.clientName)
-            .value("clientVersion", profile.clientVersion)
-            .value("hl", "en")
-            .value("gl", countryCode)
-            .value("osName", profile.osName)
-            .value("osVersion", profile.osVersion)
-            .value("deviceMake", profile.deviceMake)
-            .value("deviceModel", profile.deviceModel)
-            .value("userAgent", profile.userAgent)
-
-        if (profile.androidSdkVersion != null) {
-            clientBuilder.value("androidSdkVersion", profile.androidSdkVersion)
+        val payloadObj = buildJsonObject {
+            putJsonObject("context") {
+                putJsonObject("client") {
+                    put("clientName", profile.clientName)
+                    put("clientVersion", profile.clientVersion)
+                    put("hl", "en")
+                    put("gl", countryCode)
+                    put("osName", profile.osName)
+                    put("osVersion", profile.osVersion)
+                    put("deviceMake", profile.deviceMake)
+                    put("deviceModel", profile.deviceModel)
+                    put("userAgent", profile.userAgent)
+                    if (profile.androidSdkVersion != null) {
+                        put("androidSdkVersion", profile.androidSdkVersion)
+                    }
+                    if (profile.platform != null) {
+                        put("platform", profile.platform)
+                    }
+                    if (!visitorData.isNullOrBlank()) {
+                        put("visitorData", visitorData)
+                    }
+                }
+            }
+            put("videoId", videoId)
+            put("cpn", cpn)
+            put("contentCheckOk", true)
+            put("racyCheckOk", true)
         }
-        if (profile.platform != null) {
-            clientBuilder.value("platform", profile.platform)
-        }
-        if (!visitorData.isNullOrBlank()) {
-            clientBuilder.value("visitorData", visitorData)
-        }
-
-        val jsonPayload = clientBuilder
-            .end() // client
-            .end() // context
-            .value("videoId", videoId)
-            .value("cpn", cpn)
-            .value("contentCheckOk", true)
-            .value("racyCheckOk", true)
-            .end()
-            .done()
 
         val reqBuilder = Request.Builder()
             .url(profile.endpointUrl)
@@ -328,7 +344,7 @@ object InnerTubeFallbackClient {
             .header("X-YouTube-Client-Name", profile.clientIdHeader)
             .header("X-YouTube-Client-Version", profile.clientVersion)
             .header("X-Goog-Api-Format-Version", "2")
-            .post(jsonPayload.toRequestBody(JSON_MEDIA_TYPE))
+            .post(payloadObj.toString().toRequestBody(JSON_MEDIA_TYPE))
 
         if (!visitorData.isNullOrBlank()) {
             reqBuilder.header("X-Goog-Visitor-Id", visitorData)
@@ -341,7 +357,7 @@ object InnerTubeFallbackClient {
         NewPipeOkHttpDownloader.getInstance().okHttpClient.newCall(reqBuilder.build()).execute().use { resp ->
             if (!resp.isSuccessful) return null
             val body = resp.body?.string() ?: return null
-            return JsonParser.`object`().from(body)
+            return jsonParser.parseToJsonElement(body).jsonObject
         }
     }
 
@@ -349,7 +365,6 @@ object InnerTubeFallbackClient {
         val now = System.currentTimeMillis()
         cachedVisitorData?.takeIf { now < visitorDataExpiresAtMs }?.let { return it }
 
-        // Fast method 1: sw.js_data
         val fromSw = runCatching {
             val req = Request.Builder()
                 .url("https://www.youtube.com/sw.js_data")
@@ -369,20 +384,17 @@ object InnerTubeFallbackClient {
             return fromSw
         }
 
-        // Method 2: youtubei/v1/guide responseContext.visitorData
         val fromGuide = runCatching {
-            val payload = JsonWriter.string()
-                .`object`()
-                .`object`("context")
-                .`object`("client")
-                .value("clientName", "WEB")
-                .value("clientVersion", "2.20260708.01.00")
-                .value("hl", "en")
-                .value("gl", countryCode)
-                .end()
-                .end()
-                .end()
-                .done()
+            val payload = buildJsonObject {
+                putJsonObject("context") {
+                    putJsonObject("client") {
+                        put("clientName", "WEB")
+                        put("clientVersion", "2.20260708.01.00")
+                        put("hl", "en")
+                        put("gl", countryCode)
+                    }
+                }
+            }.toString()
             val req = Request.Builder()
                 .url("https://www.youtube.com/youtubei/v1/guide?prettyPrint=false")
                 .header("User-Agent", NewPipeOkHttpDownloader.USER_AGENT)
@@ -391,8 +403,8 @@ object InnerTubeFallbackClient {
             NewPipeOkHttpDownloader.getInstance().okHttpClient.newCall(req).execute().use { resp ->
                 if (!resp.isSuccessful) return@use null
                 val body = resp.body?.string() ?: return@use null
-                val obj = JsonParser.`object`().from(body)
-                obj.getObject("responseContext")?.getString("visitorData")
+                val obj = jsonParser.parseToJsonElement(body).jsonObject
+                obj.obj("responseContext")?.str("visitorData")
             }
         }.getOrNull()
 
