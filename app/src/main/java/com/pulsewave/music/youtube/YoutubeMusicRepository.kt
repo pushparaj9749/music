@@ -338,15 +338,16 @@ class YoutubeMusicRepository {
             val br = audio.averageBitrate.coerceAtLeast(128)
             val mime = audio.format?.mimeType
             val clen = YoutubeHttpEngine.parseClenFromUrl(audio.content)
+            val itag = audio.itagItem
             val dashXml = if (
                 audio.deliveryMethod == DeliveryMethod.PROGRESSIVE_HTTP &&
-                audio.itagItem != null &&
+                itag != null &&
                 info.duration > 0L
             ) {
                 runCatching {
                     YoutubeProgressiveDashManifestCreator.fromProgressiveStreamingUrl(
                         audio.content,
-                        audio.itagItem,
+                        itag,
                         info.duration
                     )
                 }.getOrNull()
